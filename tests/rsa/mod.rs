@@ -90,6 +90,43 @@ fn round_trip_sign_verification_pem_pkcs8() {
     }
 }
 
+#[cfg(feature = "use_pem")]
+#[test]
+#[wasm_bindgen_test]
+fn invalid_pem_payload_is_rejected_through_public_api() {
+    use jsonwebtoken::errors::ErrorKind;
+
+    let bad_private_key = b"-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+    assert_eq!(
+        EncodingKey::from_rsa_pem(bad_private_key).unwrap_err().kind(),
+        &ErrorKind::InvalidKeyFormat
+    );
+
+    let bad_public_key = b"-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----\n";
+    assert_eq!(
+        DecodingKey::from_rsa_pem(bad_public_key).unwrap_err().kind(),
+        &ErrorKind::InvalidKeyFormat
+    );
+}
+
+#[cfg(feature = "use_pem")]
+#[test]
+#[wasm_bindgen_test]
+fn pem_family_mismatch_is_rejected_through_public_api() {
+    use jsonwebtoken::errors::ErrorKind;
+
+    assert_eq!(
+        EncodingKey::from_rsa_pem(include_bytes!("../ecdsa/private_ecdsa_key.pem"))
+            .unwrap_err()
+            .kind(),
+        &ErrorKind::InvalidKeyFormat
+    );
+    assert_eq!(
+        DecodingKey::from_ec_pem(include_bytes!("public_rsa_key_pkcs8.pem")).unwrap_err().kind(),
+        &ErrorKind::InvalidKeyFormat
+    );
+}
+
 #[test]
 #[wasm_bindgen_test]
 fn round_trip_sign_verification_der() {

@@ -1,4 +1,7 @@
+use std::fmt::{Debug, Formatter};
+
 use crate::errors::{ErrorKind, Result};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Supported PEM files for EC and RSA Public and Private Keys
 #[derive(Debug, PartialEq)]
@@ -40,12 +43,23 @@ enum Classification {
 /// Documentation about these formats is at
 /// PKCS#1: https://tools.ietf.org/html/rfc8017
 /// PKCS#8: https://tools.ietf.org/html/rfc5958
-#[derive(Debug)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct PemEncodedKey {
     content: Vec<u8>,
-    asn1: Vec<simple_asn1::ASN1Block>,
+    #[zeroize(skip)]
     pem_type: PemType,
+    #[zeroize(skip)]
     standard: Standard,
+}
+
+impl Debug for PemEncodedKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PemEncodedKey")
+            .field("content", &"[redacted]")
+            .field("pem_type", &self.pem_type)
+            .field("standard", &self.standard)
+            .finish()
+    }
 }
 
 impl PemEncodedKey {
@@ -53,21 +67,15 @@ impl PemEncodedKey {
     pub fn new(input: &[u8]) -> Result<PemEncodedKey> {
         match pem::parse(input) {
             Ok(content) => {
-                let Ok(asn1_content) = simple_asn1::from_der(content.contents()) else {
-                    return Err(ErrorKind::InvalidKeyFormat.into());
-                };
-
                 match content.tag() {
                     // This handles a PKCS#1 RSA Private key
                     "RSA PRIVATE KEY" => Ok(PemEncodedKey {
                         content: content.into_contents(),
-                        asn1: asn1_content,
                         pem_type: PemType::RsaPrivate,
                         standard: Standard::Pkcs1,
                     }),
                     "RSA PUBLIC KEY" => Ok(PemEncodedKey {
                         content: content.into_contents(),
-                        asn1: asn1_content,
                         pem_type: PemType::RsaPublic,
                         standard: Standard::Pkcs1,
                     }),
@@ -77,42 +85,23 @@ impl PemEncodedKey {
                     // "there is no such thing as a "PKCS#1 format" for elliptic curve (EC) keys"
 
                     // This handles PKCS#8 certificates and public & private keys
-                    tag @ ("PRIVATE KEY" | "PUBLIC KEY" | "CERTIFICATE") => {
-                        match classify_pem(&asn1_content) {
-                            Some(c) => {
-                                let is_private = tag == "PRIVATE KEY";
-                                let pem_type = match c {
-                                    Classification::Ec => {
-                                        if is_private {
-                                            PemType::EcPrivate
-                                        } else {
-                                            PemType::EcPublic
-                                        }
-                                    }
-                                    Classification::Ed => {
-                                        if is_private {
-                                            PemType::EdPrivate
-                                        } else {
-                                            PemType::EdPublic
-                                        }
-                                    }
-                                    Classification::Rsa => {
-                                        if is_private {
-                                            PemType::RsaPrivate
-                                        } else {
-                                            PemType::RsaPublic
-                                        }
-                                    }
-                                };
-                                Ok(PemEncodedKey {
-                                    content: content.into_contents(),
-                                    asn1: asn1_content,
-                                    pem_type,
-                                    standard: Standard::Pkcs8,
-                                })
-                            }
-                            None => Err(ErrorKind::InvalidKeyFormat.into()),
-                        }
+                    tag @ "PRIVATE KEY" | tag @ "PUBLIC KEY" | tag @ "CERTIFICATE" => {
+                        let is_private = tag == "PRIVATE KEY";
+                        let pem_type = match classify_der(content.contents())
+                            .ok_or(ErrorKind::InvalidKeyFormat)?
+                        {
+                            Classification::Ec if is_private => PemType::EcPrivate,
+                            Classification::Ec => PemType::EcPublic,
+                            Classification::Ed if is_private => PemType::EdPrivate,
+                            Classification::Ed => PemType::EdPublic,
+                            Classification::Rsa if is_private => PemType::RsaPrivate,
+                            Classification::Rsa => PemType::RsaPublic,
+                        };
+                        Ok(PemEncodedKey {
+                            content: content.into_contents(),
+                            pem_type,
+                            standard: Standard::Pkcs8,
+                        })
                     }
 
                     // Unknown/unsupported type
@@ -139,7 +128,8 @@ impl PemEncodedKey {
         match self.standard {
             Standard::Pkcs1 => Err(ErrorKind::InvalidKeyFormat.into()),
             Standard::Pkcs8 => match self.pem_type {
-                PemType::EcPublic => extract_first_bitstring(&self.asn1),
+                PemType::EcPublic => extract_first_bitstring_der(&self.content)
+                    .ok_or_else(|| ErrorKind::InvalidKeyFormat.into()),
                 _ => Err(ErrorKind::InvalidKeyFormat.into()),
             },
         }
@@ -161,7 +151,8 @@ impl PemEncodedKey {
         match self.standard {
             Standard::Pkcs1 => Err(ErrorKind::InvalidKeyFormat.into()),
             Standard::Pkcs8 => match self.pem_type {
-                PemType::EdPublic => extract_first_bitstring(&self.asn1),
+                PemType::EdPublic => extract_first_bitstring_der(&self.content)
+                    .ok_or_else(|| ErrorKind::InvalidKeyFormat.into()),
                 _ => Err(ErrorKind::InvalidKeyFormat.into()),
             },
         }
@@ -172,70 +163,225 @@ impl PemEncodedKey {
         match self.standard {
             Standard::Pkcs1 => Ok(self.content.as_slice()),
             Standard::Pkcs8 => match self.pem_type {
-                PemType::RsaPrivate => extract_first_bitstring(&self.asn1),
-                PemType::RsaPublic => extract_first_bitstring(&self.asn1),
+                PemType::RsaPrivate | PemType::RsaPublic => {
+                    extract_first_bitstring_der(&self.content)
+                        .ok_or_else(|| ErrorKind::InvalidKeyFormat.into())
+                }
                 _ => Err(ErrorKind::InvalidKeyFormat.into()),
             },
         }
     }
 }
 
+const TAG_BIT_STRING: u8 = 0x03;
+const TAG_OCTET_STRING: u8 = 0x04;
+const TAG_OID: u8 = 0x06;
+const TAG_SEQUENCE: u8 = 0x30;
+
 // This really just finds and returns the first bitstring or octet string
 // Which is the x coordinate for EC public keys
 // And the DER contents of an RSA key
 // Though PKCS#11 keys shouldn't have anything else.
 // It will get confusing with certificates.
-fn extract_first_bitstring(asn1: &[simple_asn1::ASN1Block]) -> Result<&[u8]> {
-    for asn1_entry in asn1 {
-        match asn1_entry {
-            simple_asn1::ASN1Block::Sequence(_, entries) => {
-                if let Ok(result) = extract_first_bitstring(entries) {
-                    return Ok(result);
-                }
-            }
-            simple_asn1::ASN1Block::BitString(_, _, value) => {
-                return Ok(value.as_ref());
-            }
-            simple_asn1::ASN1Block::OctetString(_, value) => {
-                return Ok(value.as_ref());
-            }
-            _ => (),
+fn extract_first_bitstring_der(bytes: &[u8]) -> Option<&[u8]> {
+    let mut stack = vec![bytes];
+
+    while let Some(bytes) = stack.pop() {
+        let Some((tag, value, rest)) = read_tlv(bytes) else {
+            continue;
+        };
+
+        if !rest.is_empty() {
+            stack.push(rest);
         }
-    }
 
-    Err(ErrorKind::InvalidEcdsaKey.into())
-}
-
-/// Find whether this is EC, RSA, or Ed
-/// Note: Ed448 keys are not supported
-fn classify_pem(asn1: &[simple_asn1::ASN1Block]) -> Option<Classification> {
-    // These should be constant but the macro requires
-    // #![feature(const_vec_new)]
-    let ec_public_key_oid = simple_asn1::oid!(1, 2, 840, 10_045, 2, 1);
-    let rsa_public_key_oid = simple_asn1::oid!(1, 2, 840, 113_549, 1, 1, 1);
-    // Defined: https://datatracker.ietf.org/doc/html/rfc8410#section-3 id-Ed25519)
-    let ed25519_oid = simple_asn1::oid!(1, 3, 101, 112);
-
-    for asn1_entry in asn1 {
-        match asn1_entry {
-            simple_asn1::ASN1Block::Sequence(_, entries) => {
-                if let Some(classification) = classify_pem(entries) {
-                    return Some(classification);
+        match tag {
+            TAG_BIT_STRING => {
+                if value.is_empty() || value[0] != 0 {
+                    return None;
                 }
+                return Some(&value[1..]);
             }
-            simple_asn1::ASN1Block::ObjectIdentifier(_, oid) => {
-                if oid == ec_public_key_oid {
-                    return Some(Classification::Ec);
-                }
-                if oid == rsa_public_key_oid {
-                    return Some(Classification::Rsa);
-                }
-                if oid == ed25519_oid {
-                    return Some(Classification::Ed);
-                }
+            TAG_OCTET_STRING => return Some(value),
+            TAG_SEQUENCE => {
+                stack.push(value);
             }
             _ => {}
         }
     }
+
     None
+}
+
+/// Find whether this is EC, RSA, or Ed
+/// Note: Ed448 keys are not supported
+fn classify_der(bytes: &[u8]) -> Option<Classification> {
+    const EC_PUBLIC_KEY_OID: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+    const RSA_PUBLIC_KEY_OID: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+    const ED25519_OID: &[u8] = &[0x2B, 0x65, 0x70];
+
+    let mut stack = vec![bytes];
+
+    while let Some(bytes) = stack.pop() {
+        let Some((tag, value, rest)) = read_tlv(bytes) else {
+            continue;
+        };
+
+        if !rest.is_empty() {
+            stack.push(rest);
+        }
+
+        if tag == TAG_OID {
+            match value {
+                EC_PUBLIC_KEY_OID => return Some(Classification::Ec),
+                RSA_PUBLIC_KEY_OID => return Some(Classification::Rsa),
+                ED25519_OID => return Some(Classification::Ed),
+                _ => {}
+            }
+        } else if tag == TAG_SEQUENCE {
+            stack.push(value);
+        }
+    }
+
+    None
+}
+
+fn read_tlv(mut bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let first = bytes[0];
+    bytes = &bytes[1..];
+    let tag = if first & 0x1f == 0x1f {
+        while !bytes.is_empty() && bytes[0] & 0x80 != 0 {
+            bytes = &bytes[1..];
+        }
+        if bytes.is_empty() {
+            return None;
+        }
+        bytes = &bytes[1..];
+        0xff
+    } else {
+        first
+    };
+
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let len = bytes[0];
+    bytes = &bytes[1..];
+    let len = if len < 0x80 {
+        len as usize
+    } else {
+        let len_len = (len & 0x7f) as usize;
+        if len_len == 0 || std::mem::size_of::<usize>() < len_len || bytes.len() < len_len {
+            return None;
+        }
+        let (len_bytes, rest) = bytes.split_at(len_len);
+        bytes = rest;
+        len_bytes.iter().fold(0, |acc, &x| acc * 256 + x as usize)
+    };
+
+    if bytes.len() < len {
+        return None;
+    }
+
+    let (value, rest) = bytes.split_at(len);
+    Some((tag, value, rest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_ec_key() {
+        let pem = pem::parse(include_bytes!("../../tests/ecdsa/public_ecdsa_key.pem")).unwrap();
+        assert_eq!(classify_der(pem.contents()), Some(Classification::Ec));
+    }
+
+    #[test]
+    fn classify_rsa_key() {
+        let pem = pem::parse(include_bytes!("../../tests/rsa/public_rsa_key_pkcs8.pem")).unwrap();
+        assert_eq!(classify_der(pem.contents()), Some(Classification::Rsa));
+    }
+
+    #[test]
+    fn classify_ed25519_key() {
+        let pem = pem::parse(include_bytes!("../../tests/eddsa/public_ed25519_key.pem")).unwrap();
+        assert_eq!(classify_der(pem.contents()), Some(Classification::Ed));
+    }
+
+    #[test]
+    fn ec_public_key_extraction() {
+        let key =
+            PemEncodedKey::new(include_bytes!("../../tests/ecdsa/public_ecdsa_key.pem")).unwrap();
+        let bytes = key.as_ec_public_key().unwrap();
+        assert_eq!(bytes[0], 0x04);
+        assert_eq!(bytes.len(), 65);
+    }
+
+    #[test]
+    fn ed_public_key_extraction() {
+        let key =
+            PemEncodedKey::new(include_bytes!("../../tests/eddsa/public_ed25519_key.pem")).unwrap();
+        let bytes = key.as_ed_public_key().unwrap();
+        assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn rsa_pkcs8_key_extraction() {
+        let key =
+            PemEncodedKey::new(include_bytes!("../../tests/rsa/public_rsa_key_pkcs8.pem")).unwrap();
+        let bytes = key.as_rsa_key().unwrap();
+        assert_eq!(bytes[0], 0x30);
+    }
+
+    #[test]
+    fn rsa_pkcs1_key() {
+        let key = PemEncodedKey::new(include_bytes!("../../tests/rsa/private_rsa_key_pkcs1.pem"))
+            .unwrap();
+        let bytes = key.as_rsa_key().unwrap();
+        assert_eq!(bytes[0], 0x30);
+    }
+
+    #[test]
+    fn pem_debug_redacts_key_material() {
+        let key = PemEncodedKey::new(include_bytes!("../../tests/rsa/private_rsa_key_pkcs1.pem"))
+            .unwrap();
+        let debug = format!("{key:?}");
+
+        assert!(debug.contains("content: \"[redacted]\""));
+        assert!(!debug.contains("content: ["));
+    }
+
+    #[test]
+    fn pem_with_valid_tag_but_invalid_der_is_rejected() {
+        let err =
+            PemEncodedKey::new(b"-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----\n")
+                .unwrap_err();
+
+        assert_eq!(err.kind(), &ErrorKind::InvalidKeyFormat);
+    }
+
+    #[test]
+    fn malformed_tlv_returns_none() {
+        assert!(read_tlv(&[]).is_none());
+        assert!(read_tlv(&[TAG_SEQUENCE]).is_none());
+        assert!(read_tlv(&[TAG_SEQUENCE, 0x80]).is_none());
+        assert!(read_tlv(&[TAG_SEQUENCE, 0x82, 0x01]).is_none());
+        assert!(read_tlv(&[TAG_SEQUENCE, 0x03, 0x01, 0x02]).is_none());
+        assert!(read_tlv(&[0x1f, 0x81]).is_none());
+    }
+
+    #[test]
+    fn bitstring_extraction_requires_byte_aligned_value() {
+        assert_eq!(
+            extract_first_bitstring_der(&[TAG_BIT_STRING, 0x03, 0x00, 0xaa, 0xbb]),
+            Some([0xaa, 0xbb].as_slice())
+        );
+        assert!(extract_first_bitstring_der(&[TAG_BIT_STRING, 0x02, 0x01, 0xaa]).is_none());
+    }
 }
